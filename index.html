@@ -1,0 +1,1120 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-fullscreen">
+<meta name="theme-color" content="#000000">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Dungeon Rush</title>
+<style>
+  html,body{margin:0;position:fixed;top:0;left:0;right:0;bottom:0;width:100%;height:100%;background:#000;overflow:hidden;overscroll-behavior:none;touch-action:none;
+    user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+  body{display:flex;align-items:center;justify-content:center}
+  canvas{display:block;touch-action:none}
+  #rot{display:none;color:#fff;font:20px monospace;text-align:center;padding:20px}
+  @media (orientation:portrait) and (pointer:coarse){ #rot{display:block} canvas{display:none} }
+</style>
+</head>
+<body>
+<canvas id="c" width="800" height="608"></canvas>
+<div id="rot">Rotate your phone to landscape ↻</div>
+<script>
+// ===== 1. Alapbeállítások =====
+const TILE = 32, ROWS = 19, BOSS_EVERY = 10;
+// Képarány: telefonon a KIJELZŐ méretéből számolunk (a böngésző címsora/teljes képernyő nem változtatja), gépen az ablakból
+const winW = window.innerWidth || 800, winH = window.innerHeight || 608;
+const isTouch = !!(window.matchMedia && window.matchMedia("(pointer:coarse)").matches);
+const scrW = (typeof screen !== "undefined" && screen.width) || winW, scrH = (typeof screen !== "undefined" && screen.height) || winH;
+const SCR_W = isTouch ? scrW : winW, SCR_H = isTouch ? scrH : winH;
+const ASPECT = Math.max(SCR_W, SCR_H) / Math.min(SCR_W, SCR_H);            // fekvő képarány
+const COLS = Math.max(25, Math.min(47, Math.round(ROWS * ASPECT)));        // széles képernyőn szélesebb a pálya
+const W = COLS * TILE, H = ROWS * TILE;                                    // a játék belső mérete (pixel)
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+
+// A vászon az ablakba illeszkedik (aránytartóan), éles marad nagy és nagy felbontású kijelzőn is
+let pxScale = 1;
+function fit() {
+  const vv = window.visualViewport, vw = (vv && vv.width) || window.innerWidth || W, vh = (vv && vv.height) || window.innerHeight || H;
+  const s = Math.min(vw / W, vh / H);
+  pxScale = Math.min(4, s * (window.devicePixelRatio || 1), Math.sqrt(3.5e6 / (W * H)));   // éles, de nem túl nehéz a telefonnak
+  canvas.width = Math.round(W * pxScale); canvas.height = Math.round(H * pxScale);
+  if (canvas.style) { canvas.style.width = W * s + "px"; canvas.style.height = H * s + "px"; }
+}
+window.addEventListener("resize", fit);
+window.addEventListener("orientationchange", () => { fit(); setTimeout(fit, 300); });
+document.addEventListener("fullscreenchange", () => { fit(); setTimeout(fit, 300); });
+if (window.visualViewport) window.visualViewport.addEventListener("resize", fit);
+window.addEventListener("contextmenu", e => e.preventDefault());
+window.addEventListener("gesturestart", e => e.preventDefault());           // iOS: nincs nagyítás csippentéssel
+fit();
+
+// Teljes képernyő (felhasználói érintés/kattintás kell hozzá): PC-n F billentyűvel is
+function goFullscreen() {
+  try {
+    const el = document.documentElement;
+    if (document.fullscreenElement || document.webkitFullscreenElement) return;
+    const r = el.requestFullscreen ? el.requestFullscreen() : el.webkitRequestFullscreen && el.webkitRequestFullscreen();
+    if (r && r.then) r.then(() => { if (screen.orientation && screen.orientation.lock) screen.orientation.lock("landscape").catch(() => {}); }).catch(() => {});
+  } catch (e) {}
+}
+function toggleFullscreen() {
+  try { if (document.fullscreenElement) document.exitFullscreen(); else goFullscreen(); } catch (e) {}
+}
+window.addEventListener("keydown", e => { if (e.key.toLowerCase() === "f" && !e.repeat) toggleFullscreen(); });
+
+// ===== 2. Bemenet: billentyűzet, egér, érintés =====
+const keys = {};
+const mouse = { x: W / 2, y: H / 2 };
+let joy = { x: 0, y: 0 }, joyId = null, joyStart = null, joyNow = null;
+let touchUsed = false, wantFs = false;
+
+function toCanvas(cx, cy) {                       // képernyő -> vászon koordináta
+  const r = canvas.getBoundingClientRect();
+  return { x: (cx - r.left) * W / r.width, y: (cy - r.top) * H / r.height };
+}
+window.addEventListener("keydown", e => { keys[e.key.toLowerCase()] = true; if (e.key === " ") e.preventDefault(); });
+window.addEventListener("keyup",   e => { keys[e.key.toLowerCase()] = false; });
+canvas.addEventListener("mousemove", e => { Object.assign(mouse, toCanvas(e.clientX, e.clientY)); });
+canvas.addEventListener("mousedown", e => {
+  const p = toCanvas(e.clientX, e.clientY);
+  if (menu) { menuClick(p); return; }
+  if (shopOpen) { shopClick(p); return; }
+  if (won) { continueGame(); return; }
+  if (inRect(p, WEAPON_BTN)) { cycleWeapon(); return; }
+  if (inRect(p, PAUSE_BTN)) { openPause(); return; }
+  if (gameOver) { retry(); return; }
+  attackAt(p);
+});
+
+const PAUSE_BTN = { x: W - 46, y: 6, w: 36, h: 28 };      // szünet gomb (jobb felső sarok)
+const WEAPON_BTN = { x: W - 150, y: 40, w: 140, h: 36 };     // fegyverváltó gomb (jobb felső sarok)
+let aim = null;                                           // aktív célzó joystick: {id, sx, sy, x, y}
+// Célzás: csak az IRÁNY számít. A célkereszt arra az ellenségre tapad, amelyik a joystick irányában
+// (±40 fokon belül) és a fegyver hatótávján belül van; több jelölt közül a közelebbit választja.
+function aimInfo() {
+  const dx = aim.x - aim.sx, dy = aim.y - aim.sy;
+  if (Math.hypot(dx, dy) < 20) return null;                 // kis kitérés = mégsem célzok
+  const ang = Math.atan2(dy, dx), w = weapon();
+  let target = null, bs = 1e9;
+  for (const en of enemies) {
+    if (!en.visible) continue;
+    const d = dist(player, en);
+    if (d > w.range + en.r) continue;
+    let da = Math.abs(Math.atan2(en.y - player.y, en.x - player.x) - ang);
+    if (da > Math.PI) da = 2 * Math.PI - da;
+    if (da > 0.7) continue;
+    const sc = da + d / w.range * 0.3;
+    if (sc < bs) { bs = sc; target = en; }
+  }
+  const r = target ? dist(player, target) : w.range * 0.7;
+  return { ang, target, x: player.x + Math.cos(ang) * r, y: player.y + Math.sin(ang) * r };
+}
+canvas.addEventListener("touchstart", e => {
+  e.preventDefault(); touchUsed = true;
+  const t0 = e.changedTouches[0], p0 = toCanvas(t0.clientX, t0.clientY);
+  if (menu) { menuClick(p0); wantFs = !menu; return; }   // a teljes képernyőhöz az érintés felengedése kell
+  if (shopOpen) { shopClick(p0); return; }
+  if (won) { continueGame(); return; }
+  if (gameOver) { retry(); return; }
+  for (const t of e.changedTouches) {
+    const p = toCanvas(t.clientX, t.clientY);
+    if (inRect(p, WEAPON_BTN)) { cycleWeapon(); continue; }
+    if (inRect(p, PAUSE_BTN)) { openPause(); continue; }
+    if (p.x < W / 2 && joyId === null) { joyId = t.identifier; joyStart = p; joyNow = p; }          // bal oldal: mozgás
+    else if (p.x >= W / 2 && aim === null) aim = { id: t.identifier, sx: p.x, sy: p.y, x: p.x, y: p.y }; // jobb oldal: célzás
+  }
+}, { passive: false });
+canvas.addEventListener("touchmove", e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    const p = toCanvas(t.clientX, t.clientY);
+    if (t.identifier === joyId) {
+      joyNow = p;
+      const dx = p.x - joyStart.x, dy = p.y - joyStart.y, len = Math.hypot(dx, dy);
+      joy = len > 10 ? { x: dx / len, y: dy / len } : { x: 0, y: 0 };
+    }
+    if (aim && t.identifier === aim.id) { aim.x = p.x; aim.y = p.y; }
+  }
+}, { passive: false });
+function touchEnd(e) {
+  if (wantFs) { wantFs = false; goFullscreen(); }           // a teljes képernyőhöz az érintés felengedése kell
+  for (const t of e.changedTouches) {
+    if (t.identifier === joyId) { joyId = null; joy = { x: 0, y: 0 }; }
+    if (aim && t.identifier === aim.id) {
+      const c = aimInfo(); aim = null;
+      if (c && c.target) attackAt({ x: c.target.x, y: c.target.y }, 6);   // elengedés = ütés a célkeresztre tapadt ellenségre
+      else if (c) player.rangeT = 0.3;                                    // nincs célpont az irányban/hatótávon belül
+    }
+  }
+}
+canvas.addEventListener("touchend", touchEnd);
+canvas.addEventListener("touchcancel", touchEnd);
+
+// Melyik ellenségen van a kattintás? (kis ráhagyással, hogy könnyebb legyen eltalálni)
+function enemyAt(p, tol = 10) {
+  let best = null, bd = 1e9;
+  for (const en of enemies) {
+    const d = Math.hypot(en.x - p.x, en.y - p.y);
+    if (en.visible && d < en.r + tol && d < bd) { bd = d; best = en; }
+  }
+  return best;
+}
+function addText(x, y, str, c) { texts.push({ x, y, s: str, c, t: 0.7 }); }
+
+// Támadás: ellenségre kell kattintani, és közel kell lenni hozzá. Ütés után rövid várakozás van.
+// Fegyvertípusok: alap (1 célpont) | cleave = a célpont körüli területen mindenkit sebez | line = a vonalban mindenkit átüt |
+// chain = a célpontról a közeli ellenségekre ugrik | beam = sugár látszik a célpontig (távoli fegyver)
+function attackAt(p, tol = 10) {
+  if (!started || menu || gameOver || won || shopOpen) return;
+  const w = weapon(), en = enemyAt(p, tol);
+  if (!en) return;                                                      // nem ellenségre céloztál
+  if (dist(player, en) > w.range + en.r) { player.rangeT = 0.3; return; } // túl messze: hatótáv jelzése
+  if (player.atkCd > 0) return;
+  player.atkCd = player.atkMax = player.cdBase * w.cdM; player.swing = 0.12;
+  const ang = Math.atan2(en.y - player.y, en.x - player.x);
+  player.angle = ang;
+  player.beam = w.beam ? { x: en.x, y: en.y } : null;
+  const dmg = Math.round(player.dmg * w.dmgM);
+  let hits = [{ t: en, d: dmg }];
+  if (w.cleave) {                                                       // terület: a célpont körül mindenkit sebez
+    for (const o of enemies) if (o !== en && o.visible && dist(o, en) < w.cleave) hits.push({ t: o, d: dmg });
+    blasts.push({ x: en.x, y: en.y, r: w.cleave, t: 0.25, max: 0.25, c: w.color });
+  }
+  if (w.line) {                                                         // vonal: mindenkit átüt, aki a vonalban áll
+    const ca = Math.cos(ang), sa = Math.sin(ang);
+    hits = enemies.filter(o => {
+      if (o === en) return true;
+      if (!o.visible) return false;
+      const dx = o.x - player.x, dy = o.y - player.y, along = dx * ca + dy * sa, side = Math.abs(-dx * sa + dy * ca);
+      return along > 0 && along <= w.range + o.r && side <= o.r + w.line;
+    }).map(o => ({ t: o, d: dmg }));
+    player.beam = { x: player.x + ca * w.range, y: player.y + sa * w.range };
+  }
+  if (w.chain) {                                                        // villámlánc: ugrik a legközelebbi, még nem talált ellenségre
+    const used = [en]; let d = dmg, last = en;
+    for (let i = 0; i < w.chain; i++) {
+      let nx = null, bd = w.chainR;
+      for (const o of enemies) if (!used.includes(o) && o.visible && dist(o, last) < bd) { bd = dist(o, last); nx = o; }
+      if (!nx) break;
+      d = Math.max(1, Math.round(d * 0.75)); used.push(nx); hits.push({ t: nx, d }); last = nx;
+    }
+    zaps.push({ pts: [[player.x, player.y], ...used.map(o => [o.x, o.y])], t: 0.2, c: w.color });
+  }
+  sfx(w.chain ? "zap" : w.beam ? "beam" : "hit");
+  for (const { t, d } of hits) {
+    t.hp -= d; t.flash = 0.12; if (!t.boss) t.aiming = false; else t.splitDmg = (t.splitDmg || 0) + d;            // villanás, hátralökés (a boss célzását nem szakítjuk meg)
+    const a = Math.atan2(t.y - player.y, t.x - player.x), kb = t.boss ? 5 : 16;
+    move(t, Math.cos(a) * kb, Math.sin(a) * kb);
+    addText(t.x, t.y - t.r - 8, String(d), w.color);
+  }
+}
+
+// ===== Fegyverek: a magasabb pályák új fegyvereket nyitnak (a legmélyebb elért pálya megmarad a következő játékra is) =====
+const WEAPONS = [   // megszerzési sorrend: 10 pályánként egy új fegyver (a lista szint szerint rendezett)
+  { name: "Sword",          lvl: 1,  dmgM: 1,   range: 64,  cdM: 1,    color: "#ffffff", desc: "basic, fast" },
+  { name: "Bow",            lvl: 10, dmgM: 0.7, range: 230, cdM: 1.3,  beam: true, color: "#88ff88", desc: "long range, slow" },   // gyengítve: kisebb sebzés, lassabb lövés
+  { name: "Fire Staff",        lvl: 20, dmgM: 1,   range: 200, cdM: 1.6,  cleave: 80, beam: true, color: "#ff6a3d", desc: "long range, area" },
+  { name: "Spear",       lvl: 30, dmgM: 1.1, range: 105, cdM: 1.15, line: 10, color: "#99ccff", desc: "pierces in a line" },
+  { name: "Lightning Staff",     lvl: 40, dmgM: 0.9, range: 180, cdM: 1.2,  chain: 3, chainR: 120, color: "#7fd4ff", desc: "chain lightning" },
+  { name: "Crossbow",    lvl: 50, dmgM: 1.3, range: 300, cdM: 1.5,  line: 8, color: "#c8ff66", desc: "long range, pierces a line" },
+  { name: "Battle Axe",     lvl: 60, dmgM: 1.5, range: 72,  cdM: 1.4,  cleave: 55, color: "#ffaa66", desc: "area, strong" },
+  { name: "Legendary Sword", lvl: 70, dmgM: 2,   range: 90,  cdM: 1,    cleave: 60, color: "#ffdd44", desc: "area, very strong" }
+];
+// Mentés (böngésző helyi tárolója): store.best = legmélyebb pálya, store.cur = utolsó pálya,
+// store.snaps[n] = az n. pálya elején érvényes állapot (életerő, sebzés, arany, bolti árak...)
+let store = { best: 1, cur: 0, snaps: {}, tokens: 5, tokT: 0, loadout: null, beaten: 0, muted: false };
+try {
+  const raw = localStorage.getItem("dungeonRushSave");
+  if (raw) store = Object.assign(store, JSON.parse(raw));
+  else store.best = +localStorage.getItem("dungeonRushBest") || 1;
+} catch (e) {}
+if ((store.wv || 0) < 3) {                                // régi mentés: a fegyverek sorrendje megváltozott, átszámoljuk az indexeket
+  const mp1 = [0, 1, 3, 5, 7];                            // 5 fegyveres mentés -> 2. sorrend
+  const mp2 = [0, 3, 2, 6, 4, 1, 5, 7];                   // 2. sorrend -> mostani
+  const conv = i => { if (i == null) return i; let j = i; if (!store.wv) j = mp1[j] != null ? mp1[j] : 0; return mp2[j] != null ? mp2[j] : 0; };
+  for (const k in store.snaps) { const s = store.snaps[k]; if (s && s.weapon != null) s.weapon = conv(s.weapon); }
+  if (Array.isArray(store.loadout)) store.loadout = store.loadout.map(conv);
+  store.wv = 3;
+}
+if ((store.wv || 0) < 4) { store.beaten = Math.max(0, (store.best || 1) - 1); store.wv = 4; }
+if ((store.wv || 0) < 5) store.wv = 5;
+if (!store.tokRefill) { store.tokens = 5; store.tokT = 0; store.tokRefill = 1; }   // egyszeri tokenfeltöltés (a mentésben jelölve, többször nem fut le)   // régi mentés: a teszt mód megszűnt
+let bestLevel = store.best || 1;
+function persist() { store.best = bestLevel; try { localStorage.setItem("dungeonRushSave", JSON.stringify(store)); } catch (e) {} }
+function snapshot() {
+  return { maxHp: player.maxHp, dmg: player.dmg, cdBase: player.cdBase, speed: player.speed, gold, goldMult, weapon: player.weapon, prices: shopItems.map(i => i.price) };
+}
+const levelPages = () => Math.max(1, Math.ceil(bestLevel / 20));
+const weapon = () => WEAPONS[player.weapon];
+// Fegyver: a megfelelő pálya (bossfight) TELJESÍTÉSEKOR jár; alapból csak a Kard van nyitva
+const isOpen = i => !!WEAPONS[i] && (WEAPONS[i].lvl <= 1 || WEAPONS[i].lvl <= (store.beaten || 0));
+function loadout() {                                      // a körbe vihető (max. 3) fegyver: csak ezeket használhatod a pályán
+  let l = (Array.isArray(store.loadout) ? store.loadout : []).filter((i, k, a) => isOpen(i) && a.indexOf(i) === k);
+  if (!l.length) l = WEAPONS.map((w, i) => i).filter(isOpen);
+  return l.slice(0, 3);
+}
+function toggleLoadout(i) {                               // fegyvermenü: kijelölés / levétel (4.-nél a legrégebbi cserélődik)
+  let l = loadout();
+  if (l.includes(i)) { if (l.length > 1) l = l.filter(x => x !== i); }
+  else { l.push(i); if (l.length > 3) l.shift(); }
+  store.loadout = l; persist();
+}
+function selectSlot(k) { const l = loadout(); if (l[k] != null) player.weapon = l[k]; }
+function cycleWeapon() { const l = loadout(); player.weapon = l[(l.indexOf(player.weapon) + 1) % l.length]; }
+// Token: minden pálya-indítás (új pálya, újrapróba, menüből indítás) 1 tokenbe kerül, a pálya teljesítése 1-et visszaad.
+// Ha a számláló 5 alá esett, a legelső csökkenéstől számított 1 óra múlva újra 5 lesz.
+const MAX_TOKENS = 5, TOKEN_MS = 3600000;
+const TOKENS_ON = false;                                  // ideiglenesen KI: nincs tokenfogyás, nincs tokenkorlát (később: true)
+function tokens() {
+  const now = Date.now();
+  if (typeof store.tokens !== "number" || isNaN(store.tokens)) store.tokens = MAX_TOKENS;
+  if (store.tokT && store.tokT > now + TOKEN_MS) store.tokT = now;           // visszaállított óra ellen
+  if (store.tokT && now - store.tokT >= TOKEN_MS) { store.tokens = MAX_TOKENS; store.tokT = 0; persist(); }
+  return store.tokens;
+}
+function spendToken() { if (!TOKENS_ON) return; const t = tokens(); store.tokens = Math.max(0, t - 1); if (!store.tokT) store.tokT = Date.now(); persist(); }
+function refundToken() { if (!TOKENS_ON) return; const t = tokens(); store.tokens = Math.min(MAX_TOKENS, t + 1); if (store.tokens >= MAX_TOKENS) store.tokT = 0; persist(); }
+function tokenText() {
+  const t = tokens(); let s = "Token: " + t + "/" + MAX_TOKENS;
+  if (t < MAX_TOKENS && store.tokT) s += "  |  refills to 5 in " + Math.max(1, Math.ceil((store.tokT + TOKEN_MS - Date.now()) / 60000)) + " min";
+  return s;
+}
+let menuMsgS = "", menuMsgT = 0;
+function flashMenu(s) { menuMsgS = s; menuMsgT = Date.now() + 3500; }
+function canStart() {                                     // pályaindítás előtt: van-e token?
+  if (!TOKENS_ON || tokens() > 0) return true;
+  flashMenu("No tokens! " + tokenText().split("|")[1].trim());
+  return false;
+}
+function retry() { if (canStart()) newGame(level); else menu = "title"; }   // halál után: újrapróba (1 token)
+function noteLevel() {                                    // új rekord pálya (a pályaválasztóhoz); fegyvert NEM ad, az a pálya teljesítésekor jár
+  if (level <= bestLevel) return;
+  bestLevel = level;
+  persist();
+}
+window.addEventListener("keydown", e => {                 // PC: 1-3 = fegyver a kiválasztottak közül, Q = következő
+  if (!started || menu || shopOpen || e.repeat) return;
+  if (e.key >= "1" && e.key <= "3") selectSlot(+e.key - 1);
+  if (e.key.toLowerCase() === "q") cycleWeapon();
+});
+
+// ===== 3. Játékállapot =====
+let map, player, enemies, loot, level, gold, gameOver, won, started = false, texts = [], arrows = [], blasts = [], zaps = [], spawnCount = 0, shopOpen = false, shopItems = [], endless = false, notice = null, menu = "title", menuPage = 0, menuBack = "title";
+let exitOpen, killed, total, reserve, spawnT, refunded = false, goldMult = 1, coinFly = null;
+
+function newGame(n = 1) {
+  const sn = n > 1 ? store.snaps[n] : null;                 // az adott pálya elején mentett állapot
+  level = n; gold = sn ? sn.gold : 0; goldMult = sn && sn.goldMult ? sn.goldMult : 1; gameOver = false; won = false; texts = []; shopOpen = false; endless = false;
+  shopItems = newShop();
+  if (sn) shopItems.forEach((it, i) => { if (sn.prices && sn.prices[i]) it.price = sn.prices[i]; });
+  const mh = sn ? sn.maxHp : 150;
+  player = { x: 64, y: 304, r: 10, hp: mh, maxHp: mh, speed: sn ? sn.speed : 150, dmg: sn ? sn.dmg : 12, atkCd: 0, atkMax: 0.35,
+    cdBase: sn ? sn.cdBase : 0.35, hurtT: 0, weapon: (sn && loadout().includes(sn.weapon)) ? sn.weapon : loadout()[0], beam: null, swing: 0, rangeT: 0, angle: 0 };
+  loadLevel();
+}
+
+// Színvilágok: pályánként változnak
+const THEMES = [
+  { f1: "#2a2a35", f2: "#2e2e3a", w: "#4a3b5c" }, { f1: "#2b3226", f2: "#2f372a", w: "#4f5e3c" },
+  { f1: "#352a2a", f2: "#3a2e2e", w: "#6a3b3b" }, { f1: "#262d38", f2: "#2a3240", w: "#3b5470" },
+  { f1: "#33302a", f2: "#38352e", w: "#6b5d3a" }
+];
+let exitPos = { x: 0, y: 0 };
+
+// Barlang-szerű kazamata: nagy nyílt terek sziklacsoportokkal (cellás automata), mindenhol összefüggő
+function generateDungeon() {
+  const openN = (x, y) => { let n = 0; for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) if (!map[y + dy][x + dx]) n++; return n; };
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const p = Math.min(0.38, 0.30 + level * 0.01);                 // mélyebben kicsit több szikla
+    map = Array.from({ length: ROWS }, (_, y) => Array.from({ length: COLS }, (_, x) =>
+      (x === 0 || y === 0 || x === COLS - 1 || y === ROWS - 1 || Math.random() < p) ? 1 : 0));
+    for (let it = 0; it < 4; it++) {                               // simítás: a sok fal közti mező fal lesz, különben szabad
+      const nm = map.map(r => r.slice());
+      for (let y = 1; y < ROWS - 1; y++) for (let x = 1; x < COLS - 1; x++) {
+        let w = 0;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) if (map[y + dy][x + dx]) w++;
+        nm[y][x] = w >= 5 ? 1 : 0;
+      }
+      map = nm;
+    }
+    // a legnagyobb összefüggő terület kell; a többi zárt zsebet befalazzuk
+    const seen = Array.from({ length: ROWS }, () => Array(COLS).fill(false));
+    let best = [];
+    for (let y = 1; y < ROWS - 1; y++) for (let x = 1; x < COLS - 1; x++) {
+      if (map[y][x] || seen[y][x]) continue;
+      const reg = [[x, y]]; seen[y][x] = true;
+      for (let i = 0; i < reg.length; i++) {
+        const [cx, cy] = reg[i];
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const nx = cx + dx, ny = cy + dy;
+          if (!map[ny][nx] && !seen[ny][nx]) { seen[ny][nx] = true; reg.push([nx, ny]); }
+        }
+      }
+      if (reg.length > best.length) best = reg;
+    }
+    if (best.length < (COLS - 2) * (ROWS - 2) * 0.55) continue;                               // túl kevés hely: új próba
+    const keep = new Set(best.map(([x, y]) => y * COLS + x));
+    for (let y = 1; y < ROWS - 1; y++) for (let x = 1; x < COLS - 1; x++) if (!map[y][x] && !keep.has(y * COLS + x)) map[y][x] = 1;
+    // kezdőpont: a bal szélén, nyílt helyen; kijárat: a legtávolabbi nyílt hely
+    const openTiles = best.filter(([x, y]) => openN(x, y) === 9);
+    const starts = (openTiles.length ? openTiles : best).sort((a, b) => a[0] - b[0] || Math.abs(a[1] - 9) - Math.abs(b[1] - 9));
+    player.x = starts[0][0] * TILE + TILE / 2; player.y = starts[0][1] * TILE + TILE / 2;
+    buildFlow();
+    let far = starts[0], fd = -1;
+    for (const [x, y] of (openTiles.length ? openTiles : best)) if (flow[y][x] > fd) { fd = flow[y][x]; far = [x, y]; }
+    exitPos = { x: far[0] * TILE + TILE / 2, y: far[1] * TILE + TILE / 2 };
+    return;
+  }
+  map = Array.from({ length: ROWS }, (_, y) => Array.from({ length: COLS }, (_, x) => (x === 0 || y === 0 || x === COLS - 1 || y === ROWS - 1) ? 1 : 0));
+  player.x = 64; player.y = 304; exitPos = { x: W - 64, y: 304 };     // tartalék: üres terem
+}
+
+function loadLevel() {
+  noteLevel();
+  if (started) spendToken();                              // minden pálya-indítás 1 token
+  refunded = false;
+  if (started) { store.snaps[level] = snapshot(); store.cur = level; persist(); }   // a pálya elején mentünk
+  generateDungeon();
+  enemies = []; loot = []; arrows = []; blasts = []; zaps = []; coinFly = null; exitOpen = false; killed = 0; spawnT = 2; spawnCount = 0;
+  buildFlow();
+
+  const isBoss = level % BOSS_EVERY === 0;            // minden 10. pálya bossfight
+  if (isBoss && !(notice && notice.t > 0)) notice = { text: "BOSSFIGHT!", t: 3 };
+  total = isBoss ? 1 + Math.round(level * 1.2) : Math.round(5 + level * 1.8);   // bossfight: kevesebb kísérő, de erősebb boss     // ennyi szörnyet kell megölni
+  reserve = total;                                // ennyi még nem jelent meg
+  if (isBoss) { spawnEnemy(true); reserve--; }
+  for (let i = 0; i < Math.min(5, 2 + Math.ceil(level / 3)) && reserve > 0; i++) { spawnEnemy(false); reserve--; }
+}
+
+// Fegyverek: csak akkor vesznek el, ha az 1. pályáról indulsz újra (új játék). Halál / visszatérés másik pályára nem vesz el semmit.
+function startAt(n) {
+  if (!canStart()) return;
+  if (n === 1) { store.beaten = 0; store.loadout = [0]; persist(); }
+  started = true; menu = null; newGame(n); goFullscreen();
+}
+function openPause() {
+  if (!started || menu || shopOpen) return;
+  joyId = null; joy = { x: 0, y: 0 }; aim = null; menu = "pause";
+}
+function openLevels(from) {
+  menuBack = from; menu = "levels";
+  menuPage = Math.min(levelPages() - 1, Math.floor(Math.max(0, (store.cur || 1) - 1) / 20));
+}
+// A menü gombjai az aktuális képernyő szerint (cím / szünet / pályák)
+function menuButtons() {
+  const B = (label, y, go) => ({ x: W / 2 - 160, y, w: 320, h: 52, label, go });
+  if (menu === "levels") {
+    const bs = [], x0 = W / 2 - 253;
+    for (let i = 0; i < 20; i++) {
+      const n = menuPage * 20 + i + 1;
+      if (n > bestLevel) break;
+      bs.push({ x: x0 + (i % 5) * 104, y: 150 + Math.floor(i / 5) * 68, w: 90, h: 54, label: String(n), go: () => startAt(n),
+        off: !(n === 1 || store.snaps[n]), boss: n % BOSS_EVERY === 0, cur: n === store.cur });
+    }
+    bs.push({ x: W / 2 - 220, y: 450, w: 90, h: 44, label: "<", go: () => { menuPage = Math.max(0, menuPage - 1); } });
+    bs.push({ x: W / 2 - 100, y: 450, w: 200, h: 44, label: "Back", go: () => { menu = menuBack; } });
+    bs.push({ x: W / 2 + 130, y: 450, w: 90, h: 44, label: ">", go: () => { menuPage = Math.min(levelPages() - 1, menuPage + 1); } });
+    return bs;
+  }
+  if (menu === "weapons") {
+    const bs = [], lo = loadout();
+    WEAPONS.forEach((w, i) => {
+      const slot = lo.indexOf(i), open = isOpen(i);
+      bs.push({ x: W / 2 - 310 + (i % 2) * 320, y: 150 + Math.floor(i / 2) * 62, w: 300, h: 54, go: () => toggleLoadout(i),
+        label: (slot >= 0 ? "[" + (slot + 1) + "] " : "") + w.name, sub: open ? w.desc : "unlocked by level " + w.lvl + " boss", off: !open, sel: slot >= 0, col: w.color });
+    });
+    bs.push({ x: W / 2 - 100, y: 450, w: 200, h: 44, label: "Back", go: () => { menu = "title"; } });
+    return bs;
+  }
+  if (menu === "pause") return [B("CONTINUE", 260, () => { menu = null; }), B("LEVELS", 324, () => openLevels("pause")), B("MAIN MENU", 388, () => { menu = "title"; }), B("SOUND: " + (store.muted ? "OFF" : "ON"), 452, () => toggleSound())];
+  const has = store.cur > 0 && (store.cur === 1 || store.snaps[store.cur]), bs = [];   // főmenü
+  let y = 312;
+  if (has) { bs.push(B("CONTINUE - level " + store.cur, y, () => startAt(store.cur))); y += 58; }
+  bs.push(B(has ? "NEW GAME" : "PLAY", y, () => startAt(1))); y += 58;
+  bs.push(B("WEAPONS", y, () => { menu = "weapons"; })); y += 58;
+  if (bestLevel > 1) bs.push(B("LEVELS", y, () => openLevels("title")));
+  return bs;
+}
+function menuClick(p) { for (const b of menuButtons()) if (!b.off && inRect(p, b)) { sfx("click"); b.go(); break; } }
+window.addEventListener("keydown", e => {                 // Esc / P: szünet (és vissza a menükben)
+  if (e.repeat) return;
+  const k = e.key.toLowerCase();
+  if (k === "n") { toggleSound(); return; }
+  if (k !== "escape" && k !== "p") return;
+  if (menu === "pause") menu = null; else if (menu === "levels") menu = menuBack; else if (menu === "weapons") menu = "title"; else openPause();
+});
+function continueGame() { won = false; endless = true; }   // a 10. pálya után végtelen mód
+
+function spawnEnemy(boss) {
+  let ex, ey;
+  do { ex = rand(3, COLS - 1) * TILE + 16; ey = rand(1, ROWS - 1) * TILE + 16; }
+  while (isWall(ex, ey) || flow[Math.floor(ey / TILE)][Math.floor(ex / TILE)] < 0 || Math.hypot(ex - player.x, ey - player.y) < 250);  // ne a játékos mellett
+  // Típus: közelharcos / íjász (az 1. pályától) / sprinter (a 2. pályától)
+  let type = "melee";
+  if (!boss) {
+    const pa = Math.min(0.2, 0.07 + level * 0.02);                          // íjász (kör) esélye – csökkentve
+    const ps = level >= 2 ? Math.min(0.35, 0.14 + (level - 1) * 0.04) : 0;   // sprinter (háromszög) esélye – növelve
+    const pb = level >= 8 ? Math.min(0.15, 0.06 + (level - 8) * 0.01) : 0;    // bomba (creeper) esélye a 8. pályától
+    const q = Math.random();
+    if (q < pa) type = "archer"; else if (q < pa + ps) type = "sprinter"; else if (q < pa + ps + pb) type = "bomber";
+    if (level >= 2 && spawnCount === 2) type = "sprinter";      // biztosan legyen egy sprinter a pályán
+    if (level >= 8 && spawnCount === 4) type = "bomber";        // és a 8. pályától egy bomba is
+  }
+  spawnCount++;
+  const S = {
+    melee:    { r: 10, hp: 18 + level * 6, speed: 48 + level * 3,  dmg: Math.round(6 + level * 0.9) },
+    archer:   { r: 9,  hp: 28 + level * 6, speed: 50,              dmg: Math.round(5 + level * 0.8) },
+    sprinter: { r: 8,  hp: 12 + level * 3, speed: 140 + level * 2, dmg: Math.round(10 + level * 0.9) },
+    bomber:   { r: 9,  hp: 20 + level * 5, speed: 70 + level * 2,  dmg: Math.round(20 + level * 2.2) }    // dmg = robbanás sebzése
+  }[type];
+  if (boss) Object.assign(S, { r: 14, hp: 250 + level * 60, speed: 50 + level, dmg: Math.round(30 + level * 2) });   // erősebb boss (a mérete marad, hogy átférjen a folyosókon)
+  enemies.push({ x: ex, y: ey, type, r: S.r, hp: S.hp, maxHp: S.hp, speed: S.speed, dmg: S.dmg,
+    cd: type === "archer" ? 1 + Math.random() : 0, flash: 0, boss, lives: boss ? 3 : 1, split: boss && level % 20 === 0 ? 2 : 0, splitDmg: 0, state: "chase", t: 0, aiming: false, aim: 0 });   // a boss 3 életű
+}
+
+// ===== Hang (Web Audio: a hangokat a böngésző generálja, nincs külső fájl) =====
+let AC = null, master = null;
+function audioInit() {                                    // az első érintés/billentyű után indul (a böngészők ezt kérik)
+  if (AC) { if (AC.state === "suspended") AC.resume(); return; }
+  try { AC = new (window.AudioContext || window.webkitAudioContext)(); master = AC.createGain(); master.gain.value = store.muted ? 0 : 0.3; master.connect(AC.destination); }
+  catch (e) { AC = null; }
+}
+function tone(freq, dur, type = "square", vol = 0.3, slide = 0, delay = 0) {   // egy hangjegy, opcionális hangmagasság-csúszással
+  if (!AC || store.muted) return;
+  const t0 = AC.currentTime + delay, o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(freq, t0);
+  if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(20, freq * slide), t0 + dur);
+  g.gain.setValueAtTime(vol, t0); g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+  o.connect(g); g.connect(master); o.start(t0); o.stop(t0 + dur + 0.03);
+}
+function noise(dur, vol = 0.25, hp = 800) {               // zajpuffanás (ütés, robbanás)
+  if (!AC || store.muted) return;
+  const n = Math.floor(AC.sampleRate * dur), buf = AC.createBuffer(1, n, AC.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+  const s = AC.createBufferSource(), f = AC.createBiquadFilter(), g = AC.createGain();
+  s.buffer = buf; f.type = "highpass"; f.frequency.value = hp; g.gain.value = vol;
+  s.connect(f); f.connect(g); g.connect(master); s.start();
+}
+const SFX = {
+  hit:     () => { tone(520, 0.08, "square", 0.22, 0.5); noise(0.05, 0.18, 1500); },        // ütés
+  hurt:    () => { tone(180, 0.2, "sawtooth", 0.3, 0.5); },                                 // a játékos sebződik
+  kill:    () => { tone(300, 0.15, "square", 0.2, 0.4); },                                  // szörny meghal
+  gold:    () => { tone(880, 0.07, "triangle", 0.25); tone(1320, 0.1, "triangle", 0.25, 1, 0.06); },   // arany
+  beam:    () => { tone(1000, 0.1, "triangle", 0.18, 0.5); },                               // íj / tűzbot lövés
+  shoot:   () => { tone(700, 0.08, "triangle", 0.15, 0.6); },                               // ellenséges nyíl
+  zap:     () => { noise(0.12, 0.2, 2000); tone(1200, 0.12, "sawtooth", 0.15, 0.3); },      // villámlánc
+  boom:    () => { noise(0.5, 0.5, 60); tone(90, 0.45, "sine", 0.45, 0.3); },               // bomba robbanás
+  fuse:    () => { tone(1400, 0.06, "square", 0.1); },                                      // bomba sistergés
+  revive:  () => { tone(200, 0.6, "sawtooth", 0.3, 2.5); },                                 // boss feltámad
+  levelUp: () => { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.16, "square", 0.2, 1, i * 0.09)); },
+  buy:     () => { tone(660, 0.07, "triangle", 0.25); tone(990, 0.1, "triangle", 0.25, 1, 0.07); },
+  click:   () => { tone(440, 0.04, "triangle", 0.15); },
+  death:   () => { tone(400, 0.7, "sawtooth", 0.3, 0.15); }
+};
+function sfx(name) { try { if (SFX[name]) SFX[name](); } catch (e) {} }
+function toggleSound() { store.muted = !store.muted; if (master) master.gain.value = store.muted ? 0 : 0.3; persist(); }
+window.addEventListener("pointerdown", audioInit);
+window.addEventListener("keydown", audioInit);
+
+// ===== 4. Segédfüggvények =====
+function rand(a, b) { return Math.floor(Math.random() * (b - a)) + a; }
+function isWall(px, py) {
+  const tx = Math.floor(px / TILE), ty = Math.floor(py / TILE);
+  if (tx < 0 || ty < 0 || tx >= COLS || ty >= ROWS) return true;
+  return map[ty][tx] === 1;
+}
+function blocked(x, y, r) {
+  return isWall(x - r, y - r) || isWall(x + r, y - r) || isWall(x - r, y + r) || isWall(x + r, y + r);
+}
+function move(e, dx, dy) {
+  if (!blocked(e.x + dx, e.y, e.r)) e.x += dx;
+  if (!blocked(e.x, e.y + dy, e.r)) e.y += dy;
+}
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+// ===== Látómező (árnyék) =====
+// Van-e szabad rálátás két pont között? (a vonal mentén 4 pixelenként nézzük, nincs-e fal)
+function hasLOS(x1, y1, x2, y2) {
+  const n = Math.ceil(Math.hypot(x2 - x1, y2 - y1) / 4);
+  for (let i = 1; i < n; i++) {
+    const t = i / n;
+    if (isWall(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t)) return false;
+  }
+  return true;
+}
+// Az ellenség közepére és négy szélére is nézünk, hogy ne "ugráljon be" a látótérbe
+function canSee(en) {
+  const o = en.r * 0.7;
+  return [[0, 0], [o, o], [-o, o], [o, -o], [-o, -o]]
+    .some(([dx, dy]) => hasLOS(player.x, player.y, en.x + dx, en.y + dy));
+}
+// Látómező-sokszög: 480 sugarat lövünk ki a játékosból, mindegyik a falnál áll meg
+function visPolygon() {
+  const pts = [], N = 480;
+  for (let i = 0; i < N; i++) {
+    const a = i / N * Math.PI * 2, cx = Math.cos(a), cy = Math.sin(a);
+    let d = 0;
+    while (d < W + H) { d += 4; if (isWall(player.x + cx * d, player.y + cy * d)) break; }
+    d += 10;                                      // kicsit a falba is belelátunk, hogy a fal oldala világos legyen
+    pts.push([player.x + cx * d, player.y + cy * d]);
+  }
+  return pts;
+}
+
+// Útkeresés: a játékos mezőjétől indulva minden mezőre kiszámoljuk, hány lépés a játékosig (BFS).
+// -1 = nem elérhető. A szörnyek mindig a kisebb számú szomszéd mező felé mennek.
+let flow;
+function buildFlow() {
+  const px = Math.floor(player.x / TILE), py = Math.floor(player.y / TILE);
+  flow = Array.from({ length: ROWS }, () => Array(COLS).fill(-1));
+  flow[py][px] = 0;
+  const q = [[px, py]];
+  for (let i = 0; i < q.length; i++) {
+    const [x, y] = q[i];
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= COLS || ny >= ROWS) continue;
+      if (map[ny][nx] === 1 || flow[ny][nx] !== -1) continue;
+      flow[ny][nx] = flow[y][x] + 1;
+      q.push([nx, ny]);
+    }
+  }
+}
+// Hová menjen a szörny: ha a játékos közel van, közvetlenül felé; különben a következő mező közepére
+function chaseTarget(en) {
+  const ex = Math.floor(en.x / TILE), ey = Math.floor(en.y / TILE);
+  const px = Math.floor(player.x / TILE), py = Math.floor(player.y / TILE);
+  if ((ex === px && ey === py) || flow[ey][ex] < 0 || dist(en, player) < 40) return player;
+  let best = flow[ey][ex], bx = ex, by = ey;
+  for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+    if (!dx && !dy) continue;
+    const nx = ex + dx, ny = ey + dy;
+    if (nx < 0 || ny < 0 || nx >= COLS || ny >= ROWS) continue;
+    const v = flow[ny][nx];
+    if (v < 0) continue;
+    if (dx && dy && (map[ey][ex + dx] === 1 || map[ey + dy][ex] === 1)) continue; // sarkon át ne vágjon
+    if (v < best) { best = v; bx = nx; by = ny; }
+  }
+  return { x: bx * TILE + TILE / 2, y: by * TILE + TILE / 2 };
+}
+
+// Menekülés: a legnagyobb "távolságú" szomszéd mező felé (a chaseTarget fordítottja)
+function fleeTarget(en) {
+  const ex = Math.floor(en.x / TILE), ey = Math.floor(en.y / TILE);
+  let best = flow[ey][ex], bx = ex, by = ey;
+  for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+    if (!dx && !dy) continue;
+    const nx = ex + dx, ny = ey + dy;
+    if (nx < 0 || ny < 0 || nx >= COLS || ny >= ROWS) continue;
+    const v = flow[ny][nx];
+    if (v < 0) continue;
+    if (dx && dy && (map[ey][ex + dx] === 1 || map[ey + dy][ex] === 1)) continue;
+    if (v > best) { best = v; bx = nx; by = ny; }
+  }
+  return { x: bx * TILE + TILE / 2, y: by * TILE + TILE / 2 };
+}
+function moveToward(en, t, speed, dt) {
+  const a = Math.atan2(t.y - en.y, t.x - en.x);
+  move(en, Math.cos(a) * speed * dt, Math.sin(a) * speed * dt);
+}
+function hurt(d) {
+  player.hp -= d; player.hurtT = 0.15; addText(player.x, player.y - 22, "-" + d, "#f55"); sfx("hurt");
+  if (player.hp <= 0 && !gameOver) { gameOver = true; sfx("death"); }
+}
+function fireArrow(en) {
+  sfx("shoot");
+  const a = Math.atan2(player.y - en.y, player.x - en.x);
+  arrows.push({ x: en.x, y: en.y, vx: Math.cos(a) * 260, vy: Math.sin(a) * 260, dmg: en.dmg, r: 4 });
+}
+
+// Boss: üldöz és érintésre üt. Néha lő (3 nyíl legyező), néha bombát rak (nagy robbanás).
+// A boss a saját robbanásától NEM hal meg, a harc végéig életben marad. Fele életerő alatt gyorsabb és gyakrabban támad.
+const BOSS_BLAST_R = 115;
+function bossAI(en, dt, d) {
+  const angry = en.hp < en.maxHp / 2;
+  if (en.acd == null) en.acd = 1.5;
+  if (en.acd > 5 && !en.aiming && en.state !== "fuse") en.acd = 1.5;   // biztonsági: ha egy támadás félbeszakadt, újra támad
+  if (en.state === "fuse") { en.t -= dt; if (en.t <= 0) bossBlast(en); return; }      // bomba: áll és sistereg
+  if (en.aiming) { en.aim -= dt; if (en.aim <= 0) { en.aiming = false; bossVolley(en); en.acd = angry ? 1.6 : 2.2; } return; }  // lövés: áll
+  moveToward(en, chaseTarget(en), en.speed * (angry ? 1.3 : 1), dt);
+  en.cd -= dt; en.acd -= dt;
+  if (d < en.r + player.r && en.cd <= 0) { hurt(en.dmg); en.cd = 0.8; }               // érintés
+  if (en.visible && en.acd <= 0 && d < 500) {                                          // támadás választás
+    en.acd = 99;
+    if (Math.random() < 0.5) { en.aiming = true; en.aim = 0.6; }
+    else { en.state = "fuse"; en.t = 1.4; sfx("fuse"); }
+  }
+}
+function bossSplit(en) {
+  en.split--; en.splitDmg = 0;
+  en.hp = Math.max(1, Math.ceil(en.hp / 2));                 // az életerő felét a másik kapja
+  const c = Object.assign({}, en, { x: en.x + (Math.random() < 0.5 ? -26 : 26), y: en.y, hp: Math.max(1, Math.floor(en.hp)), lives: 1,
+    split: 0, splitDmg: 0, state: "chase", aiming: false, aim: 0, acd: 2.5, cd: 0.5, flash: 0.4, visible: undefined });
+  enemies.push(c); total++;                                  // a másolatot is meg kell ölni a pálya teljesítéséhez
+  blasts.push({ x: en.x, y: en.y, r: 60, t: 0.35, max: 0.35, c: "#c070ff" });
+  addText(en.x, en.y - en.r - 14, "SPLIT!", "#c070ff");
+  sfx("revive");
+}
+function bossVolley(en) {
+  sfx("shoot");
+  const a = Math.atan2(player.y - en.y, player.x - en.x);
+  for (const o of [-0.25, 0, 0.25]) arrows.push({ x: en.x, y: en.y, vx: Math.cos(a + o) * 240, vy: Math.sin(a + o) * 240, dmg: Math.round(en.dmg * 0.6), r: 5 });
+}
+function bossBlast(en) {
+  sfx("boom");
+  blasts.push({ x: en.x, y: en.y, r: BOSS_BLAST_R, t: 0.45, max: 0.45, c: "#ff5a2a" });
+  if (dist(en, player) < BOSS_BLAST_R + player.r && hasLOS(en.x, en.y, player.x, player.y)) hurt(en.dmg);
+  for (const o of enemies) {
+    if (o === en || o.hp <= 0 || dist(o, en) >= BOSS_BLAST_R + o.r || !hasLOS(en.x, en.y, o.x, o.y)) continue;
+    const d2 = Math.round(en.dmg / 2); o.hp -= d2; o.flash = 0.12; addText(o.x, o.y - o.r - 8, String(d2), "#ff8a30");
+  }
+  en.state = "chase"; en.acd = 2.4;
+}
+
+const BLAST_R = 75;
+function explode(en) {                                    // a bomba felrobban: a falak nem engedik át, a többi szörnyet is sebzi (fele sebzés)
+  sfx("boom");
+  blasts.push({ x: en.x, y: en.y, r: BLAST_R, t: 0.35, max: 0.35, c: "#ff8a30" });
+  if (dist(en, player) < BLAST_R + player.r && hasLOS(en.x, en.y, player.x, player.y)) hurt(en.dmg);
+  for (const o of enemies) {
+    if (o === en || o.hp <= 0 || dist(o, en) >= BLAST_R + o.r || !hasLOS(en.x, en.y, o.x, o.y)) continue;
+    const d2 = Math.round(en.dmg / 2); o.hp -= d2; o.flash = 0.12; addText(o.x, o.y - o.r - 8, String(d2), "#ff8a30");
+  }
+  en.hp = 0;
+}
+
+// Minden szörnytípusnak más a viselkedése
+function updateEnemy(en, dt) {
+  const d = dist(en, player);
+
+  if (en.type === "archer") {
+    // Célzás közben megáll (piros vonal jelzi), aztán lő. A nyíl kikerülhető, ha mozogsz.
+    if (en.aiming) { en.aim -= dt; if (en.aim <= 0) { en.aiming = false; fireArrow(en); } return; }
+    if (d < 170) moveToward(en, fleeTarget(en), en.speed, dt);                         // túl közel: hátrál
+    else if (d > 300 || !en.visible) moveToward(en, chaseTarget(en), en.speed, dt);    // túl messze / nem lát: közelít
+    en.cd -= dt;
+    if (en.visible && d < 450 && en.cd <= 0) { en.aiming = true; en.aim = 0.45; en.cd = 1.8; }
+    return;
+  }
+
+  if (en.type === "bomber") {
+    // Creeper: odamegy, 85 pixelre megáll és sistereg (1,1 mp), majd felrobban. Ha kiszaladsz a körből, nem talál; ha megölöd előtte, nem robban.
+    if (en.state === "fuse") { en.t -= dt; if (en.t <= 0) explode(en); return; }
+    moveToward(en, chaseTarget(en), en.speed, dt);
+    if (d < 85 && en.visible) { en.state = "fuse"; en.t = 1.1; sfx("fuse"); }
+    return;
+  }
+
+  if (en.type === "sprinter") {
+    // chase: odarohan -> strike: megüt és 0,5 mp-ig áll -> flee: 2,5 mp-ig elfut -> újra chase
+    if (en.state === "strike") { en.t -= dt; if (en.t <= 0) { en.state = "flee"; en.t = 2.5; } return; }
+    if (en.state === "flee") { en.t -= dt; moveToward(en, fleeTarget(en), 110, dt); if (en.t <= 0) en.state = "chase"; return; }
+    moveToward(en, chaseTarget(en), en.speed, dt);
+    if (d < en.r + player.r) { hurt(en.dmg); en.state = "strike"; en.t = 0.5; }
+    return;
+  }
+
+  if (en.boss) { bossAI(en, dt, d); return; }
+
+  // Közelharcos: üldöz, érintésre sebez
+  moveToward(en, chaseTarget(en), en.speed * (en.boss && en.hp < en.maxHp / 2 ? 1.3 : 1), dt);   // a boss a fele életerő alatt dühöng: gyorsabb
+  en.cd -= dt;
+  if (d < en.r + player.r && en.cd <= 0) { hurt(en.dmg); en.cd = 0.8; }
+}
+
+// ===== Bolt (pályák között) =====
+// Bolt: minden tétel SZÁZALÉKOS (a jelenlegi értékhez képest), így a magas pályákon is ér valamit.
+// Az ár minden vásárlás után 1,25-szorosára nő (az aranybónusz 1,3-szorosára), a bónuszok viszont százalékosan halmozódnak.
+function newShop() {
+  return [
+    { name: "Faster movement (+5%)", price: 30, grow: 1.25, fn: () => { player.speed = Math.min(300, Math.round(player.speed * 1.05)); }, full: () => player.speed >= 300 },
+    { name: "Max HP +10%",           price: 35, grow: 1.25, fn: () => { const add = Math.round(player.maxHp * 0.1); player.maxHp += add; player.hp += add; } },
+    { name: "Damage +10%",           price: 45, grow: 1.25, fn: () => { player.dmg = Math.round(player.dmg * 1.1 * 10) / 10; } },
+    { name: "Faster attacks (+8%)",  price: 50, grow: 1.25, fn: () => { player.cdBase = Math.max(0.12, player.cdBase * 0.92); }, full: () => player.cdBase <= 0.12 },
+    { name: "Gold income +15%",      price: 60, grow: 1.3,  fn: () => { goldMult = Math.round(goldMult * 1.15 * 100) / 100; } }
+  ];
+}
+const CONT_BTN = { x: W / 2 - 100, y: 470, w: 200, h: 56 };
+const SHOP_MENU_BTN = { x: W / 2 - 160, y: 540, w: 150, h: 44 }, SHOP_LVL_BTN = { x: W / 2 + 10, y: 540, w: 150, h: 44 };
+// Kilépés a boltból a menübe. A következő pálya lesz a mentett folytatás (a bónuszokkal együtt), a token csak az újraindításkor fogy.
+function exitShop(to) {
+  shopOpen = false; level++;
+  levelBonus(); player.hp = player.maxHp;
+  store.snaps[level] = snapshot(); store.cur = level;
+  noteLevel(); persist();
+  menu = "title";
+  if (to === "levels") openLevels("title");
+}
+const shopRect = i => ({ x: W / 2 - 250, y: 160 + i * 62, w: 500, h: 50 });
+const inRect = (p, b) => p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h;
+function buy(i) {
+  const it = shopItems[i];
+  if (!it || gold < it.price || (it.full && it.full())) return;
+  gold -= it.price; it.fn(); it.price = Math.round(it.price * it.grow); sfx("buy");
+}
+function levelBonus() {                               // minden pálya után: min. 8 HP / 2 sebzés, vagy 3% (a nagyobb)
+  const hpAdd = Math.max(8, Math.round(player.maxHp * 0.03)), dmgAdd = Math.max(2, Math.round(player.dmg * 0.03 * 10) / 10);
+  player.maxHp += hpAdd; player.dmg = Math.round((player.dmg + dmgAdd) * 10) / 10;
+}
+function leaveShop() {                                    // tovább: új pálya, kis automatikus fejlődéssel
+  shopOpen = false; level++;
+  levelBonus();
+  player.hp = player.maxHp;                               // új pálya: újra teli életerő
+  loadLevel();
+}
+function shopClick(p) {
+  shopItems.forEach((_, i) => { if (inRect(p, shopRect(i))) buy(i); });
+  if (inRect(p, CONT_BTN)) leaveShop();
+  else if (inRect(p, SHOP_MENU_BTN)) exitShop("title");
+  else if (inRect(p, SHOP_LVL_BTN)) exitShop("levels");
+}
+window.addEventListener("keydown", e => {
+  if (!shopOpen || e.repeat) return;
+  if (e.key >= "1" && e.key <= "4") buy(+e.key - 1);
+  if (e.key === "Enter") leaveShop();
+  if (e.key === "Escape" || e.key.toLowerCase() === "m") exitShop("title");   // Esc / M: főmenü
+});
+function drawShop() {
+  ctx.fillStyle = "rgba(0,0,0,0.88)"; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = "center"; ctx.fillStyle = "#ffd700"; ctx.font = "bold 32px monospace"; ctx.fillText("SHOP", W / 2, 80);
+  ctx.fillStyle = "#fff"; ctx.font = "16px monospace";
+  ctx.fillText("Gold: " + gold + "  |  HP: " + Math.ceil(player.hp) + "/" + player.maxHp + "  |  Damage: " + player.dmg, W / 2, 120);
+  shopItems.forEach((it, i) => {
+    const b = shopRect(i), full = it.full && it.full(), ok = gold >= it.price && !full;
+    ctx.fillStyle = ok ? "#2f6f3f" : "#3a3a3a"; ctx.fillRect(b.x, b.y, b.w, b.h);
+    ctx.fillStyle = ok ? "#fff" : "#888";
+    ctx.textAlign = "left"; ctx.fillText((i + 1) + ". " + it.name, b.x + 14, b.y + 31);
+    ctx.textAlign = "right"; ctx.fillText(full ? "MAX" : it.price + " gold", b.x + b.w - 14, b.y + 31);
+  });
+  ctx.textAlign = "center";
+  const nxt = WEAPONS.find(w => w.lvl > (store.beaten || 0));   // a lista szint szerint rendezett
+  if (nxt) { ctx.fillStyle = "#aaa"; ctx.fillText("Next weapon: " + nxt.name + " (unlocked by level " + nxt.lvl + " boss)", W / 2, 440); }
+  ctx.fillStyle = "#3fbf5f"; ctx.fillRect(CONT_BTN.x, CONT_BTN.y, CONT_BTN.w, CONT_BTN.h);
+  ctx.fillStyle = "#000"; ctx.font = "bold 22px monospace"; ctx.fillText("Continue (Enter)", W / 2, CONT_BTN.y + 36);
+  for (const [b, label] of [[SHOP_MENU_BTN, "Main menu (Esc)"], [SHOP_LVL_BTN, "Levels"]]) {
+    ctx.fillStyle = "#2f6f3f"; ctx.fillRect(b.x, b.y, b.w, b.h);
+    ctx.fillStyle = "#fff"; ctx.font = "bold 15px monospace"; ctx.fillText(label, b.x + b.w / 2, b.y + 28);
+  }
+  ctx.textAlign = "left";
+}
+
+// ===== 5. Frissítés =====
+function update(dt) {
+  if (menu) { if (keys["enter"] && menu === "title") { keys["enter"] = false; menuButtons()[0].go(); } return; }
+  if (shopOpen) return;
+  if (gameOver || won) { if (keys["r"]) retry(); if (won && keys["enter"]) continueGame(); return; }
+
+  // Mozgás (billentyűzet + érintő joystick)
+  let dx = joy.x, dy = joy.y;
+  if (keys["w"]) dy -= 1;
+  if (keys["s"]) dy += 1;
+  if (keys["a"]) dx -= 1;
+  if (keys["d"]) dx += 1;
+  const len = Math.hypot(dx, dy);
+  if (len > 0) {
+    const k = Math.min(1, 1 / len);
+    move(player, dx * k * player.speed * dt, dy * k * player.speed * dt);
+  }
+
+  player.atkCd -= dt; player.swing -= dt; player.rangeT -= dt; player.hurtT -= dt;
+  for (const t of texts) { t.t -= dt; t.y -= 30 * dt; }
+  texts = texts.filter(t => t.t > 0);
+  if (notice) notice.t -= dt;
+  for (const b of blasts) b.t -= dt; blasts = blasts.filter(b => b.t > 0);
+  for (const z of zaps) z.t -= dt; zaps = zaps.filter(z => z.t > 0);
+
+  // Szörnyek mozgása és sebzése
+  buildFlow();
+  for (const en of enemies) updateEnemy(en, dt);
+
+  // Nyilak: repülnek, falba ütközve eltűnnek, a játékost eltalálva sebeznek
+  for (const ar of arrows) {
+    ar.x += ar.vx * dt; ar.y += ar.vy * dt;
+    if (isWall(ar.x, ar.y)) ar.dead = true;
+    else if (Math.hypot(ar.x - player.x, ar.y - player.y) < ar.r + player.r) { hurt(ar.dmg); ar.dead = true; }
+  }
+  arrows = arrows.filter(a => !a.dead);
+
+  // Szörnyek tolják egymást, hogy ne olvadjanak egybe
+  for (let i = 0; i < enemies.length; i++) for (let j = i + 1; j < enemies.length; j++) {
+    const a = enemies[i], b = enemies[j], d = dist(a, b), min = a.r + b.r;
+    if (d > 0 && d < min) {
+      const push = (min - d) / 2, nx = (a.x - b.x) / d, ny = (a.y - b.y) / d;
+      move(a, nx * push, ny * push); move(b, -nx * push, -ny * push);
+    }
+  }
+
+  for (const en of enemies) { en.visible = canSee(en); en.flash -= dt; }   // takarásban lévő ellenség nem látszik
+
+  // Folyamatos spawnolás: a tartalékból, max. 10 szörny egyszerre
+  spawnT -= dt;
+  if (spawnT <= 0 && reserve > 0 && enemies.length < Math.min(16, 6 + level)) {
+    spawnEnemy(false); reserve--;
+    spawnT = Math.max(1.2, 4.5 - level * 0.3);   // magasabb pályán gyakrabban
+  }
+
+  // Halott szörnyek
+  // Minden 2. boss (20., 40., ...) osztódik: ha a játékos összesen a max. életerő 25%-át elvette tőle, kettéosztódik.
+  // Csak 2-szer osztódik, a második osztódás után már nem.
+  for (const en of [...enemies]) if (en.boss && en.split > 0 && en.hp > 0 && en.splitDmg >= en.maxHp * 0.25) bossSplit(en);
+  enemies = enemies.filter(en => {
+    if (en.hp > 0) return true;
+    if (en.boss && en.lives > 1) {                          // sokéletű boss: a halála után feltámad, dühösebben (nem számít killnek)
+      sfx("revive"); en.lives--; en.hp = en.maxHp; en.speed *= 1.15; en.dmg = Math.round(en.dmg * 1.1); en.flash = 0.4;
+      blasts.push({ x: en.x, y: en.y, r: 70, t: 0.4, max: 0.4, c: "#ff3050" });
+      addText(en.x, en.y - en.r - 14, "LIFE -1! (" + en.lives + " left)", "#ffd700");
+      notice = { text: "THE BOSS REVIVES! (" + en.lives + " lives left)", t: 2.5 };
+      return true;
+    }
+    killed++; sfx("kill");
+    loot.push({ x: en.x, y: en.y, value: Math.max(1, Math.round((en.boss ? 30 + level * 5 : rand(1, 6) * (1 + level * 0.03)) * goldMult)) });
+    return false;
+  });
+
+  if (killed >= total) {                                  // pálya vége: az összes arany a játékos felé úszik
+    for (const l of loot) {
+      const dx = player.x - l.x, dy = player.y - l.y, d = Math.hypot(dx, dy) || 1, s = Math.min(d, 520 * dt);
+      l.x += dx / d * s; l.y += dy / d * s;
+    }
+  }
+  loot = loot.filter(l => {
+    if (dist(l, player) < 18) { gold += l.value; sfx("gold"); return false; }
+    return true;
+  });
+
+  // Cél: a pálya összes szörnyének megölése -> kijárat; a 10. pálya végén győzelem
+  if (killed >= total) {
+    exitOpen = true;
+    if (!refunded) {
+      refunded = true; sfx("levelUp");
+      const old = store.beaten || 0, nw = WEAPONS.filter(w => w.lvl > 1 && w.lvl > old && w.lvl <= level);   // a bossfight kivitele hozza a fegyvert
+      if (level > old) store.beaten = level;
+      const lo = loadout();                                    // az új fegyver a kiválasztottak közé kerül, ha van szabad hely
+      for (const w of nw) { const i = WEAPONS.indexOf(w); if (lo.length < 3 && !lo.includes(i)) lo.push(i); }
+      store.loadout = lo; persist();
+      refundToken();                                          // (ez menti is a store-t)
+      notice = nw.length ? { text: "BOSS DEFEATED! NEW WEAPON: " + nw.map(w => w.name).join(", ") + "!", t: 6 } : { text: TOKENS_ON ? "Level cleared! +1 token" : "Level cleared!", t: 2.5 };
+    }
+  }
+  // Ha minden arany összegyűlt: a játékos aranya a kijárat felé repül, majd megnyílik a bolt
+  if (killed >= total && loot.length === 0 && !shopOpen) {
+    if (!coinFly) coinFly = { t: 0, dur: 0.9, n: 14, sx: player.x, sy: player.y };
+    coinFly.t += dt;
+    if (coinFly.t >= coinFly.dur) { coinFly = null; shopOpen = true; }
+  }
+}
+
+// ===== 6. Rajzolás =====
+function banner(title, sub) {
+  ctx.fillStyle = "rgba(0,0,0,0.7)"; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "#fff"; ctx.textAlign = "center";
+  ctx.font = "32px monospace"; ctx.fillText(title, W / 2, 290);
+  ctx.font = "18px monospace"; ctx.fillText(sub, W / 2, 330);
+  ctx.textAlign = "left";
+}
+function draw() {
+  const cleared = killed >= total;
+  const th = THEMES[(level - 1) % THEMES.length];                 // minden ellenség halott: a teljes tér látszik
+  for (let y = 0; y < ROWS; y++)
+    for (let x = 0; x < COLS; x++) {
+      ctx.fillStyle = map[y][x] ? th.w : ((x + y) % 2 ? th.f1 : th.f2);
+      ctx.fillRect(x * TILE, y * TILE, TILE, TILE);
+    }
+  ctx.fillStyle = exitOpen ? "#3fbf5f" : "#7a2a2a"; ctx.fillRect(exitPos.x - 14, exitPos.y - 14, 28, 28); // kijárat: piros = zárt, zöld = nyitva
+
+  if (coinFly) {                                          // a játékos aranya a kijárat felé repül
+    const p = Math.min(1, coinFly.t / coinFly.dur);
+    for (let i = 0; i < coinFly.n; i++) {
+      const q = Math.max(0, Math.min(1, p * 1.4 - (i / coinFly.n) * 0.4)), e = q * q;
+      const x = coinFly.sx + (exitPos.x - coinFly.sx) * e, y = coinFly.sy + (exitPos.y - coinFly.sy) * e - Math.sin(q * Math.PI) * 40;
+      ctx.fillStyle = "#ffd700"; ctx.fillRect(x - 4, y - 4, 8, 8);
+    }
+  }
+  for (const l of loot) {
+    if (!cleared && !hasLOS(player.x, player.y, l.x, l.y)) continue;   // az arany is csak akkor látszik, ha rálátsz
+    ctx.fillStyle = "#ffd700"; ctx.fillRect(l.x - 4, l.y - 4, 8, 8);
+  }
+
+  for (const en of enemies) {
+    if (!en.visible) continue;
+    if (en.aiming) {                                  // az íjász célzóvonala
+      ctx.strokeStyle = "rgba(255,80,80,0.7)"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(en.x, en.y); ctx.lineTo(player.x, player.y); ctx.stroke();
+    }
+    const fuse = (en.type === "bomber" || en.boss) && en.state === "fuse";
+    if (fuse) {                                       // a bomba robbanási köre (ide ne állj!)
+      ctx.fillStyle = "rgba(255,70,40," + (0.12 + 0.12 * Math.abs(Math.sin(en.t * 14))) + ")";
+      const br = en.boss ? BOSS_BLAST_R : BLAST_R;
+      ctx.beginPath(); ctx.arc(en.x, en.y, br, 0, 7); ctx.fill();
+      ctx.strokeStyle = "rgba(255,90,60,0.8)"; ctx.lineWidth = 2; ctx.stroke();
+    }
+    ctx.fillStyle = en.flash > 0 || (fuse && Math.floor(en.t * 10) % 2) ? "#fff" : en.boss ? "#a01030" : en.type === "archer" ? "#4caf50" : en.type === "sprinter" ? "#ffb300" : en.type === "bomber" ? "#b84dff" : "#c04040";
+    ctx.beginPath();                                  // alak: négyzet = közelharcos, kör = íjász, háromszög = sprinter, rombusz = bomba
+    if (en.type === "bomber") { ctx.moveTo(en.x, en.y - en.r - 3); ctx.lineTo(en.x + en.r + 3, en.y); ctx.lineTo(en.x, en.y + en.r + 3); ctx.lineTo(en.x - en.r - 3, en.y); ctx.closePath(); }
+    else if (en.type === "archer") ctx.arc(en.x, en.y, en.r, 0, 7);
+    else if (en.type === "sprinter") { ctx.moveTo(en.x, en.y - en.r - 2); ctx.lineTo(en.x + en.r + 2, en.y + en.r); ctx.lineTo(en.x - en.r - 2, en.y + en.r); ctx.closePath(); }
+    else ctx.rect(en.x - en.r, en.y - en.r, en.r * 2, en.r * 2);
+    ctx.fill();
+    ctx.fillStyle = "#000"; ctx.fillRect(en.x - en.r, en.y - en.r - 6, en.r * 2, 4);
+    ctx.fillStyle = "#f33"; ctx.fillRect(en.x - en.r, en.y - en.r - 6, en.r * 2 * Math.max(0, en.hp / en.maxHp), 4);
+    if (en.boss) { ctx.fillStyle = "#ffd700"; ctx.font = "bold 12px monospace"; ctx.textAlign = "center"; ctx.fillText("x" + en.lives, en.x, en.y - en.r - 10); ctx.textAlign = "left"; }
+  }
+
+  ctx.fillStyle = "#e8ffe8";                          // nyilak (csak ott látszanak, ahová rálátsz)
+  for (const ar of arrows) if (cleared || hasLOS(player.x, player.y, ar.x, ar.y)) ctx.fillRect(ar.x - 3, ar.y - 3, 6, 6);
+
+  ctx.fillStyle = player.hurtT > 0 ? "#ff7777" : "#4aa3ff";
+  ctx.fillRect(player.x - player.r, player.y - player.r, player.r * 2, player.r * 2);
+  if (player.swing > 0) {
+    ctx.strokeStyle = weapon().color; ctx.lineWidth = 4;
+    ctx.beginPath();
+    if (player.beam) { ctx.moveTo(player.x, player.y); ctx.lineTo(player.beam.x, player.beam.y); }   // íj: sugár a célpontig
+    else ctx.arc(player.x, player.y, Math.min(weapon().range - 12, 100), player.angle - 1.0, player.angle + 1.0);
+    ctx.stroke();
+  }
+
+  for (const b of blasts) {                           // robbanások / területi ütések (az árnyék elfedi, ami nem látszik)
+    const k = b.t / b.max;
+    ctx.globalAlpha = 0.55 * k; ctx.fillStyle = b.c;
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r * (1.15 - 0.15 * k), 0, 7); ctx.fill();
+  }
+  for (const z of zaps) {                             // villámlánc
+    ctx.globalAlpha = Math.min(1, z.t / 0.2); ctx.strokeStyle = z.c; ctx.lineWidth = 3;
+    ctx.beginPath(); z.pts.forEach((q, i) => i ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1])); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  // Árnyék: mindent sötétre festünk, kivéve a látómező-sokszöget (even-odd szabály)
+  if (!cleared) {
+  const vis = visPolygon();
+  ctx.fillStyle = "rgba(0,0,0,0.75)";
+  ctx.beginPath();
+  ctx.rect(0, 0, W, H);
+  ctx.moveTo(vis[0][0], vis[0][1]);
+  for (let i = 1; i < vis.length; i++) ctx.lineTo(vis[i][0], vis[i][1]);
+  ctx.closePath();
+  ctx.fill("evenodd");
+  }
+
+  ctx.font = "bold 14px monospace"; ctx.textAlign = "center";   // lebegő sebzésszámok
+  for (const t of texts) { ctx.fillStyle = t.c; ctx.fillText(t.s, t.x, t.y); }
+  ctx.textAlign = "left";
+
+  if (player.rangeT > 0) {                          // túl messze voltál: hatótáv-gyűrű
+    ctx.strokeStyle = "#f55"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(player.x, player.y, weapon().range, 0, 7); ctx.stroke();
+  }
+
+  // Érintő vezérlők rajzolása
+  if (touchUsed) {
+    ctx.globalAlpha = 0.35; ctx.fillStyle = "#fff";
+    if (joyId !== null) { ctx.beginPath(); ctx.arc(joyStart.x, joyStart.y, 40, 0, 7); ctx.fill();
+                    ctx.beginPath(); ctx.arc(joyNow.x, joyNow.y, 20, 0, 7); ctx.fill(); }
+    if (aim) {                                       // jobb joystick
+      ctx.beginPath(); ctx.arc(aim.sx, aim.sy, 40, 0, 7); ctx.fill();
+      ctx.beginPath(); ctx.arc(aim.x, aim.y, 20, 0, 7); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    const ch = aim && aimInfo();                     // célkereszt: piros = célpontra tapadt, sárga = nincs célpont
+    if (ch) {
+      ctx.strokeStyle = ch.target ? "#ff5555" : "#ffee55"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(ch.x, ch.y, ch.target ? ch.target.r + 8 : 12, 0, 7);
+      ctx.moveTo(ch.x - 18, ch.y); ctx.lineTo(ch.x + 18, ch.y); ctx.moveTo(ch.x, ch.y - 18); ctx.lineTo(ch.x, ch.y + 18); ctx.stroke();
+      ctx.strokeStyle = "rgba(255,255,255,0.3)"; ctx.beginPath(); ctx.arc(player.x, player.y, weapon().range, 0, 7); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(player.x, player.y); ctx.lineTo(ch.x, ch.y); ctx.stroke();
+    }
+  }
+
+  // HUD: ütés-sáv (zöld = mehet, sárga = töltődik)
+  ctx.fillStyle = "#000"; ctx.fillRect(8, 28, 154, 8);
+  ctx.fillStyle = player.atkCd > 0 ? "#ca3" : "#3c3";
+  ctx.fillRect(10, 29, 150 * (player.atkCd > 0 ? 1 - player.atkCd / player.atkMax : 1), 6);
+  // HUD
+  ctx.fillStyle = "#000"; ctx.fillRect(8, 8, 154, 16);
+  ctx.fillStyle = "#3c3"; ctx.fillRect(10, 10, 150 * Math.max(0, player.hp) / player.maxHp, 12);
+  ctx.fillStyle = "#fff"; ctx.font = "14px monospace";
+  ctx.fillText("Level " + level + "  Monsters: " + killed + "/" + total + "  Gold: " + gold + (TOKENS_ON ? "  Tokens: " + tokens() + "/" + MAX_TOKENS : ""), 175, 21);
+  if (exitOpen) ctx.fillText("Head to the green exit!", W - 260, 21);
+  ctx.fillStyle = "rgba(255,255,255,0.15)"; ctx.fillRect(WEAPON_BTN.x, WEAPON_BTN.y, WEAPON_BTN.w, WEAPON_BTN.h);   // fegyver gomb
+  ctx.fillStyle = weapon().color; ctx.fillText(weapon().name, WEAPON_BTN.x + 8, WEAPON_BTN.y + 23);
+  ctx.fillStyle = "rgba(255,255,255,0.15)"; ctx.fillRect(PAUSE_BTN.x, PAUSE_BTN.y, PAUSE_BTN.w, PAUSE_BTN.h);   // szünet gomb
+  ctx.fillStyle = "#fff"; ctx.fillText("II", PAUSE_BTN.x + 13, PAUSE_BTN.y + 20);
+  if (notice && notice.t > 0) {
+    ctx.fillStyle = "rgba(0,0,0,0.75)"; ctx.fillRect(W / 2 - 250, 90, 500, 50);
+    ctx.fillStyle = "#ffd700"; ctx.font = "bold 20px monospace"; ctx.textAlign = "center";
+    ctx.fillText(notice.text, W / 2, 122); ctx.textAlign = "left"; ctx.font = "14px monospace";
+  }
+
+  if (gameOver) banner("You died! Level: " + level + ", gold: " + gold, "R / tap: restart level  |  Esc: menu");
+  if (won) banner("VICTORY! You conquered the dungeon!", "Gold: " + gold + "  |  Enter/tap: continue (endless mode)  |  R: new game");
+}
+
+// ===== 7. Játékciklus =====
+let last = performance.now();
+function drawMenu() {
+  ctx.fillStyle = "rgba(0,0,0,0.82)"; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = "center"; ctx.fillStyle = "#ffd700"; ctx.font = "bold 52px monospace";
+  ctx.fillText(menu === "levels" ? "LEVELS" : menu === "weapons" ? "WEAPONS" : menu === "pause" ? "PAUSED" : "DUNGEON RUSH", W / 2, menu === "title" ? 130 : 100);
+  ctx.fillStyle = "#ccc"; ctx.font = "14px monospace";
+  if (menu === "title") {
+    ctx.fillText("Endless dungeon: every 10th level is a boss fight, new weapons await deeper down!", W / 2, 185);
+    ctx.fillText("PC: WASD move | click an enemy to attack | 1-3 / Q weapon | Esc: pause | F: fullscreen", W / 2, 215);
+    ctx.fillText("Phone (landscape): left stick = move | right stick = aim, release to strike", W / 2, 240);
+    ctx.fillText("Top-right button = switch weapon | II = pause | R = retry after death", W / 2, 265);
+    ctx.fillText("Red square: melee | green circle: archer (shoots!) | yellow triangle: sprinter | purple diamond: bomber", W / 2, 290);
+  }
+  if (menu === "weapons") ctx.fillText("Bring up to 3 weapons into a run; you switch between the selected ones. Can't change during a level.", W / 2, 130);
+  if (TOKENS_ON) { ctx.fillStyle = tokens() > 0 ? "#ffd700" : "#ff6666"; ctx.font = "bold 16px monospace"; ctx.fillText(tokenText(), W / 2, 578); }
+  if (Date.now() < menuMsgT) { ctx.fillStyle = "#ff6666"; ctx.fillText(menuMsgS, W / 2, 555); }
+  ctx.fillStyle = "#ccc"; ctx.font = "14px monospace";
+  if (menu === "levels") ctx.fillText("Page " + (menuPage + 1) + "/" + levelPages() + "  |  deepest level: " + bestLevel + "  |  levels start with the upgrades you have then", W / 2, 520);
+  for (const b of menuButtons()) {
+    ctx.fillStyle = b.off ? "#333" : b.sel ? "#1f5fbf" : b.boss ? "#8a6d00" : "#2f6f3f"; ctx.fillRect(b.x, b.y, b.w, b.h);
+    if (b.cur || b.sel) { ctx.strokeStyle = "#ffee55"; ctx.lineWidth = 3; ctx.strokeRect(b.x, b.y, b.w, b.h); }   // sárga keret: az utolsó pálya
+    if (b.sub) {                                       // fegyver-gomb: név + leírás
+      ctx.fillStyle = b.off ? "#777" : (b.col || "#fff"); ctx.font = "bold 18px monospace"; ctx.fillText(b.label, b.x + b.w / 2, b.y + 23);
+      ctx.fillStyle = b.off ? "#777" : "#ddd"; ctx.font = "13px monospace"; ctx.fillText(b.sub, b.x + b.w / 2, b.y + 43);
+      continue;
+    }
+    ctx.fillStyle = b.off ? "#777" : "#fff"; ctx.font = "bold 20px monospace"; ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 7);
+  }
+  ctx.textAlign = "left";
+}
+
+function loop(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  ctx.setTransform(pxScale, 0, 0, pxScale, 0, 0);
+  update(dt); draw();
+  if (menu) drawMenu();
+  if (shopOpen) drawShop();
+  requestAnimationFrame(loop);
+}
+newGame();
+requestAnimationFrame(loop);
+// Telepíthető webalkalmazás: offline is fut (Capacitor/APK alatt nem kell)
+try { if ("serviceWorker" in navigator && location.protocol.startsWith("http") && !window.Capacitor) navigator.serviceWorker.register("sw.js").catch(() => {}); } catch (e) {}
+// Natív alkalmazás (Capacitor / Android): vissza gomb + teljes képernyő. Webes böngészőben ez nem fut le.
+try {
+  const CP = window.Capacitor && window.Capacitor.Plugins;
+  if (CP && CP.StatusBar) { CP.StatusBar.hide().catch(() => {}); }
+  if (CP && CP.App) {
+    CP.App.addListener("backButton", () => {              // Android vissza gomb: ugyanaz, mint az Esc
+      if (shopOpen) { exitShop("title"); return; }
+      if (menu === "pause") { menu = null; return; }
+      if (menu === "levels") { menu = menuBack; return; }
+      if (menu === "weapons") { menu = "title"; return; }
+      if (menu === "title" || !started) { CP.App.exitApp(); return; }   // főmenüben a vissza gomb kilép
+      openPause();
+    });
+  }
+} catch (e) {}
+</script>
+</body>
+</html>
